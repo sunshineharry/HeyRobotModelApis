@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # 下载 S600 端侧模型到本地源目录（默认 /mnt/models），布局与 server/config.py 一致。
-#   - Qwen3-VL-2B-Instruct   视觉 VLM（场景描述，BPU，w4）—— 视觉不需大模型，2B 足够且省 BPU
-#   - Qwen3-8B               大脑 planner（cache_4096，BPU，w4）—— 支持工具调用 FC 仿真
+#   - Qwen3-VL-4B-Instruct   视觉 VLM（场景描述，BPU，w4）—— v1 planner 上云后视觉升 4B（8B 与 whisper 同驻装不下）
 #   - whisper-medium         语音识别 ASR（BPU，w8）
 #   - WeTTS                  语音合成 TTS（CPU onnx，取自 hobot_tts）
 #   - yolo26x_demo           人体/目标检测（BPU，nash-p hbm + 官方 runtime）
@@ -20,21 +19,15 @@ mkdir -p "$MODELS_DIR" 2>/dev/null || sudo mkdir -p "$MODELS_DIR"
 [ -w "$MODELS_DIR" ] || sudo chmod 777 "$MODELS_DIR"
 dl() { wget -c -q --show-progress -O "$1" "$2"; }
 
-# ---- 视觉 VLM: Qwen3-VL-2B-Instruct (w4, 1.0.0) ----
-VLM="$MODELS_DIR/Qwen3-VL-2B-Instruct"; mkdir -p "$VLM"
-echo "[*] Qwen3-VL-2B-Instruct (视觉) ..."
+# ---- 视觉 VLM: Qwen3-VL-4B-Instruct (w4, 1.0.0) ----
+VLM="$MODELS_DIR/Qwen3-VL-4B-Instruct"; mkdir -p "$VLM"
+echo "[*] Qwen3-VL-4B-Instruct (视觉) ..."
 for f in \
-  Qwen3-VL-2B-Instruct_vision_448x448_w8-4_nash-p_corenum_4.hbm \
-  Qwen3-VL-2B-Instruct_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm \
-  Qwen3-VL-2B-Instruct_embed_tokens_w4_fp16.bin; do
-  dl "$VLM/$f" "$OSS/1.0.0/models/Qwen3-VL-2B-Instruct/w4/$f"
+  Qwen3-VL-4B-Instruct_vision_448x448_w8-4_nash-p_corenum_4.hbm \
+  Qwen3-VL-4B-Instruct_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm \
+  Qwen3-VL-4B-Instruct_embed_tokens_w4_fp16.bin; do
+  dl "$VLM/$f" "$OSS/1.0.0/models/Qwen3-VL-4B-Instruct/w4/$f"
 done
-
-# ---- 大脑 planner: Qwen3-8B (w4, cache_4096, 1.0.0) ----
-LLM="$MODELS_DIR/Qwen3-8B"; mkdir -p "$LLM"
-echo "[*] Qwen3-8B (planner) ..."
-dl "$LLM/Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm" \
-   "$OSS/1.0.0/models/Qwen3-8B/w4/Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm"
 
 # ---- ASR: whisper-medium (w8, 1.0.0) ----
 ASR="$MODELS_DIR/whisper-medium"; mkdir -p "$ASR"

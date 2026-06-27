@@ -21,7 +21,6 @@ OELLM_CONFIGS = OELLM_ROOT / "configs"
 
 VLM_BIN = OELLM_ROOT / "examples" / "vlm_demo" / "vlm"
 WHISPER_BIN = OELLM_ROOT / "examples" / "whisper_demo" / "whisper"
-LLM_BIN = OELLM_ROOT / "examples" / "llm_demo" / "llm"
 
 # 端侧大模型必须设的 L2 cache 切分（地瓜文档要求）
 HBM_ENV = {
@@ -29,15 +28,18 @@ HBM_ENV = {
     "HB_DNN_USER_DEFINED_L2M_SIZES": "6:6:6:6",
 }
 
-# ---- Qwen3-VL-2B-Instruct (w4) ----
-VLM_DIR = MODELS_DIR / "Qwen3-VL-2B-Instruct"
-VLM_MODEL_ID = "Qwen3-VL-2B-Instruct"
+# ---- Qwen3-VL-4B-Instruct (w4) ----
+# v1（planner 线上版）：planner 让出 BPU 后视觉由 2B 升到 4B（比 2B 大一点）。
+# 不上 8B：8B 的 hbm 太大，与 whisper 同驻 12GB carveout 时 whisper encode
+# 模型 hbDNNInitializeFromFiles 失败（BPU 装不下）；4B + whisper + yolo 才能共存。
+VLM_DIR = MODELS_DIR / "Qwen3-VL-4B-Instruct"
+VLM_MODEL_ID = "Qwen3-VL-4B-Instruct"
 VLM_CONFIG = {
     "model_type": "Qwen3-VL",
     "model_dir": str(VLM_DIR) + "/",
-    "vit_model_file": "Qwen3-VL-2B-Instruct_vision_448x448_w8-4_nash-p_corenum_4.hbm",
-    "llm_model_file": "Qwen3-VL-2B-Instruct_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm",
-    "embed_weight_file_path": "Qwen3-VL-2B-Instruct_embed_tokens_w4_fp16.bin",
+    "vit_model_file": "Qwen3-VL-4B-Instruct_vision_448x448_w8-4_nash-p_corenum_4.hbm",
+    "llm_model_file": "Qwen3-VL-4B-Instruct_language_chunk_512_cache_1024_w4_nash-p_corenum_4_4.hbm",
+    "embed_weight_file_path": "Qwen3-VL-4B-Instruct_embed_tokens_w4_fp16.bin",
     "vit_bpu_core": [0, 1, 2, 3],
     "prefill_bpu_core": [0, 1, 2, 3],
     "decode_bpu_core": [0, 1, 2, 3],
@@ -50,24 +52,15 @@ VLM_CONFIG = {
     "temporal_patch_size": 2,
     "patch_size": 16,
     "vocab_size": 151936,
-    "embed_dim": 2048,
+    "embed_dim": 2560,
     "image_height": 448,
     "image_width": 448,
     "image_net_mean": [0.5, 0.5, 0.5],
     "image_net_std": [0.5, 0.5, 0.5],
 }
 
-# ---- Qwen3-8B 纯文本 LLM（planner 大脑，cache_4096，支持工具调用 FC 仿真） ----
-LLM_DIR = MODELS_DIR / "Qwen3-8B"
-LLM_MODEL_ID = "Qwen3-8B"
-LLM_CONFIG = {
-    "hbm_path": str(LLM_DIR / "Qwen3-8B_language_chunk_512_cache_4096_w4_nash-p_corenum_4_4.hbm"),
-    "bpu_core": [0, 1, 2, 3],
-    "tokenizer_dir": str(OELLM_CONFIGS / "Qwen3_config") + "/",
-    "model_type": 9,
-    "enable_multi_turn": False,
-    "enable_thinking": False,
-}
+# 大脑 planner 不在本服务内：S600 部署 v1 让 planner 走线上 OpenAI 兼容大模型，
+# 本服务只承载端侧的视觉/语音/检测，不再加载本地 LLM planner。
 
 # ---- YOLO26 检测（BPU，取自地瓜 yolo26x_demo；S600 无 nano 档 BPU 预编译，用 x） ----
 # 人体跟踪等用：person=COCO class 0。运行时 hbm_runtime/cv2/numpy 与 demo 的 yolo26_det/utils

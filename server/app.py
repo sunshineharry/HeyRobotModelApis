@@ -1,11 +1,15 @@
-"""OpenAI 兼容的本地大模型服务。
+"""OpenAI 兼容的本地大模型服务（S600 端侧，四件套）。
 
-暴露两个端点，方便 Xbotics-Hey-Robot 这类只认 OpenAI 协议的客户端
-把 base_url 指到本地就用上 S600 端侧模型：
-  - POST /v1/chat/completions      -> Qwen3-VL-8B（支持 messages 里带 image_url）
+只服务**感知/语音/检测**这类端侧模型，方便 Xbotics-Hey-Robot 这类只认
+OpenAI 协议的客户端把 base_url 指到本地就用上：
+  - POST /v1/chat/completions      -> Qwen3-VL-4B 视觉（messages 必须带 image_url）
   - POST /v1/audio/transcriptions  -> whisper-medium（上传音频转文字）
+  - POST /v1/audio/speech          -> WeTTS 合成
+  - POST /v1/detect                -> YOLO26x 检测
   - GET  /v1/models                -> 列出可用模型
 
+大脑 planner 不在本服务内：S600 部署 v1 让 planner 走线上 OpenAI 兼容大模型，
+本服务不再承载本地 LLM planner。
 VLM 进程在启动时常驻加载；whisper 每次请求起一个一次性进程。
 """
 
@@ -21,14 +25,12 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from . import asr_worker, config, openai_fc
+from . import asr_worker, config
 from .detect_worker import DetectWorker
-from .llm_worker import LlmWorker
 from .tts_worker import TtsWorker
 from .vlm_worker import VlmWorker
 
 vlm = VlmWorker()      # 视觉 Qwen3-VL-4B
-llm = LlmWorker()      # planner 大脑 Qwen3-8B（cache_4096 + FC 仿真）
 tts = TtsWorker()
 detector = DetectWorker()  # 懒加载：首次 /v1/detect 才占 BPU
 
@@ -36,11 +38,9 @@ detector = DetectWorker()  # 懒加载：首次 /v1/detect 才占 BPU
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     vlm.start()
-    llm.start()
     tts.start()
     yield
     vlm.stop()
-    llm.stop()
     tts.stop()
     detector.stop()
 
@@ -58,7 +58,6 @@ def list_models():
     now = int(time.time())
     data = [
         {"id": config.VLM_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
-        {"id": config.LLM_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
         {"id": config.WHISPER_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
         {"id": config.TTS_MODEL_ID, "object": "model", "created": now, "owned_by": "wetts"},
         {"id": config.DETECT_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
@@ -119,45 +118,36 @@ def _parse_messages(messages: list[dict]) -> tuple[str, str | None]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict):
+    """仅用于视觉：messages 必须带 image_url，路由到本地 Qwen3-VL-4B。
+
+    本服务不含本地 planner（v1 让 planner 走线上）；纯文本/带 tools 的请求请直接
+    打到线上 OpenAI 兼容端点，不要发到这里。
+    """
     messages = body.get("messages")
     if not messages:
         raise HTTPException(400, "缺少 messages")
-    tools = body.get("tools")
     prompt, image_path = _parse_messages(messages)
-
-    if image_path:
-        # 带图 → 视觉 Qwen3-VL-4B
-        try:
-            content = vlm.generate(prompt or "请描述这张图片。", image_path)
-        except Exception as e:
-            raise HTTPException(500, f"VLM 推理失败: {e}")
-        tool_calls: list[dict] = []
-        model_id = config.VLM_MODEL_ID
-    else:
-        # 纯文本 / planner → Qwen3-8B（cache_4096），带 OpenAI 工具调用 FC 仿真
-        fc_prompt = openai_fc.build_prompt(messages, tools)
-        try:
-            raw = llm.generate(fc_prompt)
-        except Exception as e:
-            raise HTTPException(500, f"LLM 推理失败: {e}")
-        content, tool_calls = openai_fc.parse_output(raw)
-        model_id = config.LLM_MODEL_ID
-
-    # 有 tool_calls 时按 OpenAI 惯例 content 置 null（planner 只看 tool_calls）
-    message: dict = {"role": "assistant", "content": None if tool_calls else (content or "")}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
+    if not image_path:
+        raise HTTPException(
+            400,
+            "本地 /v1/chat/completions 仅服务视觉（messages 需带 image_url）；"
+            "planner 走线上 OpenAI 兼容端点，不在本服务内。",
+        )
+    try:
+        content = vlm.generate(prompt or "请描述这张图片。", image_path)
+    except Exception as e:
+        raise HTTPException(500, f"VLM 推理失败: {e}")
     return JSONResponse(
         {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": model_id,
+            "model": config.VLM_MODEL_ID,
             "choices": [
                 {
                     "index": 0,
-                    "message": message,
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "message": {"role": "assistant", "content": content or ""},
+                    "finish_reason": "stop",
                 }
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
