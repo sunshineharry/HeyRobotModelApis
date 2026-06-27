@@ -1,156 +1,97 @@
-# S600 端侧大模型本地服务
+# S600 端侧大模型本地服务（HeyRobotModelApis）
 
-在 RDK S600 板上，把端侧模型包成一套 **OpenAI 兼容 HTTP 接口**，让 Xbotics-Hey-Robot 这类
-只认 OpenAI 协议的客户端，把 `base_url` 指到本地就能把原来调云端的视觉/语音/语音合成换成
-S600 端侧推理：
+在 RDK S600 上，把端侧模型包成一套 **OpenAI 兼容 HTTP 接口**，让 Xbotics-Hey-Robot 这类只认
+OpenAI 协议的客户端，把 `base_url` 指到本地，就能把视觉/语音/语音合成/规划/检测**全部换成 S600
+端侧推理，零云端依赖**。
 
-| 能力 | 模型 | 跑在 | 端点 |
+| 角色 | 模型 | 跑在 | 端点 |
 |---|---|---|---|
-| VLM 视觉问答 | Qwen3-VL-8B（地瓜 BPU hbm） | **BPU** | `POST /v1/chat/completions`（支持 image_url） |
-| ASR 语音转写 | whisper-medium（地瓜 BPU hbm） | **BPU** | `POST /v1/audio/transcriptions` |
-| TTS 语音合成 | WeTTS VITS（取自 hobot_tts，onnx） | **CPU** | `POST /v1/audio/speech` |
+| 视觉 VLM（场景描述） | **Qwen3-VL-2B**（Qwen，视觉不需大模型） | BPU | `POST /v1/chat/completions`（带 image_url） |
+| 大脑 planner（规划/工具调用） | **Qwen3-8B**（cache_4096 + 工具调用 FC 仿真） | BPU | `POST /v1/chat/completions`（带 tools，无图） |
+| 语音识别 ASR | **whisper-medium** | BPU | `POST /v1/audio/transcriptions` |
+| 语音合成 TTS | **WeTTS VITS**（取自 hobot_tts） | CPU | `POST /v1/audio/speech` |
+| 人体/目标检测 | **YOLO26x**（取自 yolo26x_demo） | BPU | `POST /v1/detect`（默认只回 person） |
 
-> S600 SDK 没有 BPU 版 TTS（`oellm_runtime` 只有 LLM/VLM/VLA/ASR），所以 TTS 走 CPU 的 WeTTS；
-> 一份 Qwen3-VL-8B + whisper 可同时常驻 BPU（balanced 下 `ion_carveout` ≈10GB），TTS 在 CPU 不抢 BPU。
+`/v1/chat/completions` 按是否带图自动路由：**带图→VL-2B 视觉**；**纯文本/带 tools→Qwen3-8B 大脑**。
 
-板端部署目录：`~/S600_models`（uv 管理，代码）；模型 hbm 在 `/mnt/models`（本地源，777）。
-本目录是它在仓库里的同源副本（不含模型大文件）。
+## 关键：BPU 内存（carveout）
+
+5 个模型要同时常驻/并发，10GB carveout 装不下（whisper 会 OOM、大模型互相干扰出乱码）。**本部署用
+12GB carveout**（实测 VL-2B + Qwen3-8B + whisper + yolo 全并发跑通、5.3s、planner 正常出 tool_calls），
+CPU 仍剩约 12GB。本板 `MCB V0p2`，官方 `hb_switch_ion.sh` 写死改 v0p1.dtb 无效，需手动改 v0p2：
+
+```bash
+DTB=/boot/hobot/rdk-s600-mcb-v0p2.dtb
+sudo cp $DTB ${DTB}.bak
+sudo fdtput -t x $DTB /reserved-memory/ion_reserved reg 0x40 0xC0000000 0x0 0x80000000
+sudo fdtput -t x $DTB /reserved-memory/ion_carveout reg 0x41 0x40000000 0x3 0x00000000   # 12GB
+sudo fdtput -t x $DTB /reserved-memory/ion_cma      reg 0x44 0x40000000 0x0 0x80000000
+sudo fdtput -t x $DTB /reserved-memory/ion_uncache  reg 0x44 0xC0000000 0x0 0x80000000
+sudo reboot   # 重启后 ion_carveout 应为 0x300000000(12GB)
+```
 
 ## 目录结构
 
 ```
 ~/S600_models/                  # uv 项目（代码）
-├── pyproject.toml              # fastapi / uvicorn / httpx / python-multipart
-├── run_server.sh
-├── server/
-│   ├── config.py               # 路径/模型文件名/HBM 环境变量（MODELS_DIR=/mnt/models）
-│   ├── vlm_worker.py           # 常驻 vlm 进程（8B 热加载），喂图+prompt 取回答
-│   ├── asr_worker.py           # 调 whisper 二进制一次性转写（非 wav 自动 ffmpeg 转 16k）
-│   ├── tts_worker.py           # ctypes 常驻 WeTTS libtts.so，文本→PCM→wav
-│   └── app.py                  # FastAPI：OpenAI 兼容端点
-└── .runtime/                   # 运行期生成的 config json、临时图片/音频
+├── pyproject.toml  run_server.sh  download_models.sh
+└── server/
+    ├── config.py        # 路径/模型/HBM 环境变量（MODELS_DIR=/mnt/models）
+    ├── vlm_worker.py    # 常驻 vlm 进程（Qwen3-VL-2B），喂图+prompt
+    ├── llm_worker.py    # 常驻 llm 进程（Qwen3-8B），单行 prompt（planner）
+    ├── openai_fc.py     # 工具调用 FC 仿真：tools→Qwen3 prompt(/no_think)，解析 <tool_call>→tool_calls
+    ├── asr_worker.py    # whisper 一次性转写（非 wav 自动 ffmpeg 转 16k）
+    ├── tts_worker.py    # ctypes 常驻 WeTTS libtts.so
+    ├── detect_worker.py # 懒加载 in-process YOLO26x（系统 hbm_runtime+cv2，复用 yolo26x_demo runtime）
+    └── app.py           # FastAPI：OpenAI 兼容端点
 
 /mnt/models/                    # 模型本地源（777）
-├── Qwen3-VL-8B-Instruct/       # vision + language + embed（w4，~5.9G）
-├── whisper-medium/             # encode + decode（w8，~1.3G）
-└── wetts_tts/                  # WeTTS：lib/libtts.so + libonnxruntime + tts_model/（~210M）
+├── Qwen3-VL-2B-Instruct/  Qwen3-8B/  whisper-medium/  wetts_tts/  yolo26x_demo/
 ```
 
-服务不重写推理：VLM/ASR 直接调地瓜 `~/D-Robotics_LLM_S600_1.0.2_SDK/oellm_runtime/` 的预编译
-二进制 `vlm`/`whisper`；TTS 通过 ctypes 调 WeTTS 的 `libtts.so`。
+VLM/ASR/planner 直接调地瓜 `oellm_runtime` 预编译二进制（vlm/whisper/llm）；TTS ctypes 调 WeTTS；
+检测 in-process 调 hbm_runtime + yolo26x_demo 的 runtime。不重写推理、不改第三方库。
 
-## 前置（板端一次性）
-
-1. **ION 内存切 balanced**（8B 必需）。本板 `RDK S600 MCB V0p2`，官方 `hb_switch_ion.sh` 写死只改
-   v0p1.dtb、对本板无效，需手动改 v0p2 的 dtb 再重启：
-   ```bash
-   DTB=/boot/hobot/rdk-s600-mcb-v0p2.dtb
-   sudo cp $DTB ${DTB}.bak
-   sudo fdtput -t x $DTB /reserved-memory/ion_reserved reg 0x40 0xC0000000 0x0 0x80000000
-   sudo fdtput -t x $DTB /reserved-memory/ion_carveout reg 0x41 0x40000000 0x2 0x80000000
-   sudo fdtput -t x $DTB /reserved-memory/ion_cma      reg 0x43 0xC0000000 0x0 0x80000000
-   sudo fdtput -t x $DTB /reserved-memory/ion_uncache  reg 0x44 0x40000000 0x0 0x80000000
-   sudo reboot   # 重启后 ion_carveout 应为 10GB（reg ... 2 80000000）
-   ```
-2. **模型就位**（见「模型来源」），放在 `/mnt/models/`。
-3. **装 uv 并同步依赖**：
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   cd ~/S600_models && uv sync
-   ```
-
-## 启动 / 停止
-
-systemd user service（已配 linger，开机自起、崩溃自拉）：
+## 部署
 
 ```bash
-systemctl --user start  s600-models      # 首启加载 8B+whisper+WeTTS 约 15–20s
-systemctl --user stop   s600-models
-systemctl --user status s600-models
-journalctl --user -u s600-models -f
+# 1. ION 切 12GB carveout（见上）+ reboot
+# 2. 装 uv + 下模型
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/sunshineharry/HeyRobotModelApis.git ~/S600_models && cd ~/S600_models
+./download_models.sh          # 下 5 类模型到 /mnt/models
+uv sync
+# 3. 常驻服务（systemd user + linger，开机自起）
+systemctl --user start s600-models     # 见 run_server.sh；首启加载 VL-2B+Qwen3-8B+WeTTS ~30s
 ```
 
-临时前台调试：`cd ~/S600_models && ./run_server.sh`。服务监听 `0.0.0.0:8000`。
-
-## 接口（OpenAI 兼容）
+## 接口示例
 
 ```bash
-# VLM：messages 带 image_url（data: base64 或 http(s)）
-curl -s http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model":"Qwen3-VL-8B-Instruct",
-  "messages":[{"role":"user","content":[
-    {"type":"text","text":"这张图里有什么？"},
-    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,...."}}]}]}'
-
-# ASR：multipart 上传音频（非 16k wav 自动转码）
-curl -s http://localhost:8000/v1/audio/transcriptions -F file=@audio.wav -F language=zh
-# -> {"text":"..."}
-
-# TTS：input 文本 -> 返回 wav（16kHz mono）
-curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' \
-  -d '{"model":"wetts-vits-zh","input":"你好，我是本地语音助手。"}' -o out.wav
-
-# 列出模型
-curl -s http://localhost:8000/v1/models
+# 视觉（带图→VL-2B）
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":[{"type":"text","text":"看到了什么"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]}]}'
+# 大脑/工具调用（带 tools→Qwen3-8B，回 tool_calls）
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"Qwen3-8B","messages":[{"role":"user","content":"查北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
+# ASR / TTS / 检测
+curl -s localhost:8000/v1/audio/transcriptions -F file=@a.wav -F language=zh
+curl -s localhost:8000/v1/audio/speech -d '{"input":"你好"}' -o out.wav
+curl -s localhost:8000/v1/detect -F file=@frame.jpg            # -> {"detections":[{"box":[..],"score":..,"class":"person"}]}
 ```
 
-实测：VLM 8B 首次加载 ~14s（常驻后不再重复）、单次图文问答 ~1s 级；ASR/TTS 均秒级。
+## Xbotics-Hey-Robot 切到本地（opt-in，云端配置不动）
 
-## Xbotics-Hey-Robot 切到本地（可选 profile，云端仍可用）
+改动在 fork `sunshineharry/Xbotics-Hey-Robot` 分支 `feat/s600-local-providers`（每功能一个 commit）。
+**原 `xlerobot.real.ubuntu.yaml`（云端）保持可用**；新增 `xlerobot.real.s600.yaml` 全指本地：
 
-Hey-Robot 的视觉/语音/语音合成可切到本地服务，**做成 opt-in**：
-- 改动提交在 fork **`sunshineharry/Xbotics-Hey-Robot` 分支 `feat/s600-local-providers`**（3 个功能 commit：VLM / ASR / TTS）。
-- **原 `configs/xlerobot.real.ubuntu.yaml`（云端 dashscope/doubao/sherpa）保持不动、照常可用**；
-  另加 **`configs/xlerobot.real.s600.yaml`**（本地 profile），跑哪个配置就用哪套：
-  ```bash
-  # 云端（原样）
-  uv run hey-robot ... --config configs/xlerobot.real.ubuntu.yaml
-  # 本地 S600
-  uv run hey-robot ... --config configs/xlerobot.real.s600.yaml
-  ```
+- **planner**：`type: openai_compat`，`model: Qwen3-8B`，`api_base: http://127.0.0.1:8000/v1`（工具调用走本服务 FC 仿真）。
+- **scene_captioner（视觉）**：`model: Qwen3-VL-2B-Instruct` 指本地。
+- **ASR**：新增 `OpenAIASRClient`，`channels.voice.asr.provider: openai` 指本地 whisper。
+- **TTS**：新增 `OpenAISpeechTTSClient`，`tts.provider: openai` 指本地 WeTTS。
+- **人体跟随检测**：`perception/human_follow` 加 opt-in，设环境变量 `S600_DETECT_URL=http://127.0.0.1:8000` 即走本地 BPU `/v1/detect`，默认仍 ultralytics CPU。
 
-代码改动均为**加法**（云端 client 不受影响）：
-- **VLM**（`scene_captioner`）：s600.yaml 里 `type: openai_compat` + `model: Qwen3-VL-8B-Instruct` +
-  `api_base: http://127.0.0.1:8000/v1`（reasoning provider 都走 `OpenAICompatReasoningProvider`，只换 base_url）。
-- **ASR**：新增 `OpenAIASRClient`（`audio/asr.py`，遵循 `ASRClient` 协议 POST `/v1/audio/transcriptions`），
-  工厂注册 provider `openai`；doubao/sherpa_onnx 仍在。s600.yaml `channels.voice.asr` → `openai`。
-- **TTS**：新增 `OpenAISpeechTTSClient` + `build_tts_client` 工厂（`audio/tts.py`，返回 raw PCM16 与 doubao 同形，
-  **工厂默认仍 doubao**），`voice_loop` 改用工厂。s600.yaml `tts` → `openai`（本地 WeTTS）。
-
-冒烟（Hey-Robot 自己的 client 互跑）：TTSClient 合成 → ASRClient 转写，文本回环通过。
-
-> 配套独立仓：**[`sunshineharry/HeyRobotModelApis`](https://github.com/sunshineharry/HeyRobotModelApis)** = 本服务（S600_models）的公开发布，含 `download_models.sh`。
-
-```bash
-cd ~/Xbotics-Hey-Robot && uv run python - <<'PY'
-import asyncio, wave, io
-from hey_robot.audio.config import TTSConfig, ASRConfig
-from hey_robot.audio.tts import build_tts_client
-from hey_robot.audio.asr import build_asr_client
-tts = build_tts_client(TTSConfig(provider="openai", endpoint="http://127.0.0.1:8000/v1", resource_id="wetts-vits-zh", sample_rate=16000))
-asr = build_asr_client(ASRConfig(provider="openai", endpoint="http://127.0.0.1:8000/v1", model="whisper-medium", language="zh"))
-async def main():
-    pcm = await tts.synthesize("今天天气很好，我们一起去公园散步吧。")
-    b = io.BytesIO(); w=wave.open(b,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(pcm); w.close()
-    print(await asr.transcribe_wav(b.getvalue()))
-asyncio.run(main())
-PY
-```
-
-> planner 仍是云端 DeepSeek（未动；本次只本地化视觉/语音/合成）。
+代码改动均为加法，云端 provider（dashscope/doubao/sherpa/deepseek）不受影响。
 
 ## 模型来源 / 下载
 
-一条命令把三类模型下到本地源目录（默认 `/mnt/models`，布局与 `server/config.py` 一致）：
-
-```bash
-./download_models.sh                 # 默认 /mnt/models
-MODELS_DIR=~/models ./download_models.sh   # 自定义目录
-```
-
-它下载：
-- **Qwen3-VL-8B-Instruct**（VLM，w4，1.0.2）：vision/language/embed 三件（地瓜 OSS）。
-- **whisper-medium**（ASR，w8，1.0.0）：encode/decode 两件（地瓜 OSS）。
-- **WeTTS**（TTS，CPU onnx）：`libtts.so`+`libonnxruntime` + `tts_model/`（取自 `hobot_tts` + `archive.d-robotics.cc`）。
-
-VLM/whisper 的官方下载清单亦见解压后地瓜 SDK 的 `oellm_runtime/model/resolve_model_nash-p.md`。
+一条命令把 5 类模型下到 `/mnt/models`：`./download_models.sh`（VL/whisper/Qwen3-8B 来自地瓜 OSS，见
+`oellm_runtime/model/resolve_model_nash-p.md`；WeTTS 取自 hobot_tts；YOLO26x 取自 kol_test yolo26x_demo）。

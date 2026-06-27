@@ -21,21 +21,28 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from . import asr_worker, config
+from . import asr_worker, config, openai_fc
+from .detect_worker import DetectWorker
+from .llm_worker import LlmWorker
 from .tts_worker import TtsWorker
 from .vlm_worker import VlmWorker
 
-vlm = VlmWorker()
+vlm = VlmWorker()      # 视觉 Qwen3-VL-4B
+llm = LlmWorker()      # planner 大脑 Qwen3-8B（cache_4096 + FC 仿真）
 tts = TtsWorker()
+detector = DetectWorker()  # 懒加载：首次 /v1/detect 才占 BPU
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     vlm.start()
+    llm.start()
     tts.start()
     yield
     vlm.stop()
+    llm.stop()
     tts.stop()
+    detector.stop()
 
 
 app = FastAPI(title="S600 端侧大模型服务", lifespan=lifespan)
@@ -51,8 +58,10 @@ def list_models():
     now = int(time.time())
     data = [
         {"id": config.VLM_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
+        {"id": config.LLM_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
         {"id": config.WHISPER_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
         {"id": config.TTS_MODEL_ID, "object": "model", "created": now, "owned_by": "wetts"},
+        {"id": config.DETECT_MODEL_ID, "object": "model", "created": now, "owned_by": "d-robotics"},
     ]
     return {"object": "list", "data": data}
 
@@ -113,24 +122,42 @@ async def chat_completions(body: dict):
     messages = body.get("messages")
     if not messages:
         raise HTTPException(400, "缺少 messages")
+    tools = body.get("tools")
     prompt, image_path = _parse_messages(messages)
-    if not prompt:
-        prompt = "请描述这张图片。"
-    try:
-        text = vlm.generate(prompt, image_path)
-    except Exception as e:
-        raise HTTPException(500, f"VLM 推理失败: {e}")
+
+    if image_path:
+        # 带图 → 视觉 Qwen3-VL-4B
+        try:
+            content = vlm.generate(prompt or "请描述这张图片。", image_path)
+        except Exception as e:
+            raise HTTPException(500, f"VLM 推理失败: {e}")
+        tool_calls: list[dict] = []
+        model_id = config.VLM_MODEL_ID
+    else:
+        # 纯文本 / planner → Qwen3-8B（cache_4096），带 OpenAI 工具调用 FC 仿真
+        fc_prompt = openai_fc.build_prompt(messages, tools)
+        try:
+            raw = llm.generate(fc_prompt)
+        except Exception as e:
+            raise HTTPException(500, f"LLM 推理失败: {e}")
+        content, tool_calls = openai_fc.parse_output(raw)
+        model_id = config.LLM_MODEL_ID
+
+    # 有 tool_calls 时按 OpenAI 惯例 content 置 null（planner 只看 tool_calls）
+    message: dict = {"role": "assistant", "content": None if tool_calls else (content or "")}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return JSONResponse(
         {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": config.VLM_MODEL_ID,
+            "model": model_id,
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                 }
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -173,3 +200,18 @@ async def speech(body: dict):
         raise HTTPException(500, f"TTS 合成失败: {e}")
     # WeTTS 产出 wav；OpenAI 的 response_format 这里固定回 wav
     return Response(content=wav, media_type="audio/wav")
+
+
+@app.post("/v1/detect")
+async def detect(
+    file: UploadFile = File(...),
+    score_threshold: float = Form(default=0.35),
+    person_only: bool = Form(default=True),
+):
+    """YOLO26（BPU）目标检测，默认只回 person 框，供人体跟踪等调用。"""
+    data = await file.read()
+    try:
+        result = detector.detect(data, score_thres=score_threshold, person_only=person_only)
+    except Exception as e:
+        raise HTTPException(500, f"检测失败: {e}")
+    return result
