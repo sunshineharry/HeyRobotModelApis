@@ -96,20 +96,30 @@ curl -s http://localhost:8000/v1/models
 
 实测：VLM 8B 首次加载 ~14s（常驻后不再重复）、单次图文问答 ~1s 级；ASR/TTS 均秒级。
 
-## Xbotics-Hey-Robot 切到本地（已完成）
+## Xbotics-Hey-Robot 切到本地（可选 profile，云端仍可用）
 
-Hey-Robot 的视觉/语音/语音合成全部改成调本地服务。改动提交在 fork：
-**`sunshineharry/Xbotics-Hey-Robot` 分支 `feat/s600-local-providers`**（基于上游最新）。
+Hey-Robot 的视觉/语音/语音合成可切到本地服务，**做成 opt-in**：
+- 改动提交在 fork **`sunshineharry/Xbotics-Hey-Robot` 分支 `feat/s600-local-providers`**（3 个功能 commit：VLM / ASR / TTS）。
+- **原 `configs/xlerobot.real.ubuntu.yaml`（云端 dashscope/doubao/sherpa）保持不动、照常可用**；
+  另加 **`configs/xlerobot.real.s600.yaml`**（本地 profile），跑哪个配置就用哪套：
+  ```bash
+  # 云端（原样）
+  uv run hey-robot ... --config configs/xlerobot.real.ubuntu.yaml
+  # 本地 S600
+  uv run hey-robot ... --config configs/xlerobot.real.s600.yaml
+  ```
 
-- **VLM**（`scene_captioner`）：`configs/xlerobot.real.ubuntu.yaml` 由 `type: dashscope`（云 Qwen-VL）
-  改为 `type: openai_compat` + `model: Qwen3-VL-8B-Instruct` + `api_base: http://127.0.0.1:8000/v1`。
-  （所有 reasoning provider 最终走 `OpenAICompatReasoningProvider`，只换 base_url。）
-- **ASR**：新增 `OpenAIASRClient`（`src/hey_robot/audio/asr.py`，遵循已有 `ASRClient` 协议，POST
-  `/v1/audio/transcriptions`），工厂注册 provider `openai`；yaml `channels.voice.asr` 切到它。
-- **TTS**：新增 `OpenAISpeechTTSClient` + `build_tts_client` 工厂（`audio/tts.py`，返回 raw PCM16
-  与 doubao 客户端同形），`voice_loop` 改用工厂；yaml `tts` 由 `doubao`（云）切到 `openai` 本地。
+代码改动均为**加法**（云端 client 不受影响）：
+- **VLM**（`scene_captioner`）：s600.yaml 里 `type: openai_compat` + `model: Qwen3-VL-8B-Instruct` +
+  `api_base: http://127.0.0.1:8000/v1`（reasoning provider 都走 `OpenAICompatReasoningProvider`，只换 base_url）。
+- **ASR**：新增 `OpenAIASRClient`（`audio/asr.py`，遵循 `ASRClient` 协议 POST `/v1/audio/transcriptions`），
+  工厂注册 provider `openai`；doubao/sherpa_onnx 仍在。s600.yaml `channels.voice.asr` → `openai`。
+- **TTS**：新增 `OpenAISpeechTTSClient` + `build_tts_client` 工厂（`audio/tts.py`，返回 raw PCM16 与 doubao 同形，
+  **工厂默认仍 doubao**），`voice_loop` 改用工厂。s600.yaml `tts` → `openai`（本地 WeTTS）。
 
 冒烟（Hey-Robot 自己的 client 互跑）：TTSClient 合成 → ASRClient 转写，文本回环通过。
+
+> 配套独立仓：**[`sunshineharry/HeyRobotModelApis`](https://github.com/sunshineharry/HeyRobotModelApis)** = 本服务（S600_models）的公开发布，含 `download_models.sh`。
 
 ```bash
 cd ~/Xbotics-Hey-Robot && uv run python - <<'PY'
