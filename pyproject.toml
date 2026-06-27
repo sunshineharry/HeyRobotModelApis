@@ -1,0 +1,14 @@
+[project]
+name = "s600-models"
+version = "0.1.0"
+description = "RDK S600 端侧大模型本地服务：把地瓜 oellm_runtime 预编译的 Qwen3-VL-8B 与 whisper-medium 包成 OpenAI 兼容接口，供 Xbotics-Hey-Robot 等以 base_url 切到本地调用"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
