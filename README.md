@@ -65,17 +65,29 @@ uv sync
 systemctl --user start s600-models     # 见 run_server.sh；首启加载 VL-2B+Qwen3-8B+WeTTS ~30s
 ```
 
-## 接口示例
+## API 端点一览
+
+服务监听 `0.0.0.0:8000`。
+
+| 方法 | 路径 | 角色/模型 | 请求 | 响应 |
+|---|---|---|---|---|
+| GET | `/health` | 健康检查 | — | `{"status":"ok"}` |
+| GET | `/v1/models` | 列模型 | — | 5 个：Qwen3-VL-2B-Instruct / Qwen3-8B / whisper-medium / wetts-vits-zh / yolo26x |
+| POST | `/v1/chat/completions` | **视觉 VL-2B**（带图）/ **大脑 Qwen3-8B**（纯文本或带 tools） | OpenAI Chat：`{model, messages, tools?, tool_choice?}`；`messages` 含 `image_url`→视觉，纯文本/带 `tools`→大脑 | OpenAI `chat.completion`：`choices[0].message.content`，或带 `tool_calls`（finish_reason=tool_calls） |
+| POST | `/v1/audio/transcriptions` | **ASR whisper** | multipart：`file`(音频)、`model?`、`language?`(zh/en) | `{"text":"..."}` |
+| POST | `/v1/audio/speech` | **TTS WeTTS** | JSON：`{input, model?}` | wav 字节（`audio/wav`，16k mono） |
+| POST | `/v1/detect` | **检测 YOLO26x** | multipart：`file`(图)、`score_threshold?`(默认0.35)、`person_only?`(默认true) | `{width,height,detections:[{box:[x1,y1,x2,y2],score,class_id,class}]}` |
 
 ```bash
 # 视觉（带图→VL-2B）
-curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":[{"type":"text","text":"看到了什么"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]}]}'
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"Qwen3-VL-2B-Instruct","messages":[{"role":"user","content":[{"type":"text","text":"看到了什么"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]}]}'
 # 大脑/工具调用（带 tools→Qwen3-8B，回 tool_calls）
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"Qwen3-8B","messages":[{"role":"user","content":"查北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
 # ASR / TTS / 检测
-curl -s localhost:8000/v1/audio/transcriptions -F file=@a.wav -F language=zh
-curl -s localhost:8000/v1/audio/speech -d '{"input":"你好"}' -o out.wav
-curl -s localhost:8000/v1/detect -F file=@frame.jpg            # -> {"detections":[{"box":[..],"score":..,"class":"person"}]}
+curl -s localhost:8000/v1/audio/transcriptions -F file=@a.wav -F language=zh         # -> {"text":"..."}
+curl -s localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{"input":"你好"}' -o out.wav
+curl -s localhost:8000/v1/detect -F file=@frame.jpg                                  # -> {"detections":[{"box":[..],"score":..,"class":"person"}]}
+curl -s localhost:8000/v1/models
 ```
 
 ## Xbotics-Hey-Robot 切到本地（opt-in，云端配置不动）
